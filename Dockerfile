@@ -16,3 +16,5 @@ RUN curl -s https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/h
 
 RUN curl -LJO https://github.com/devshawn/kafka-gitops/releases/download/0.2.5/kafka-gitops.zip && unzip kafka-gitops.zip && \
     mv kafka-gitops /usr/local/bin && chmod +x /usr/local/bin/kafka-gitops && rm kafka-gitops.zip
+
+RUN pip install fabric
