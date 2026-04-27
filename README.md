@@ -2,7 +2,7 @@
 
 Multi-architecture Docker image used as the `image:` for the Bitbucket Pipelines of every Contable service. Bundles the tooling that pipelines invoke directly so individual `bitbucket-pipelines.yml` files don't need to install anything before running their commands.
 
-Built and pushed manually. Multi-arch via `docker buildx` + QEMU.
+Built and pushed manually. Multi-arch via `docker buildx` + QEMU. Hosted on **Amazon ECR** (`829063853445.dkr.ecr.us-east-2.amazonaws.com/contable/bitbucket-pipelines`) — no Docker Hub rate limits, pulls stay inside AWS, same auth as the per-service ECR repos.
 
 ## What's inside
 
@@ -23,41 +23,74 @@ OS security patches are applied at build time via `apt-get upgrade -y` on top of
 
 ## Tagging convention
 
-Each push gets two tags:
+Each push gets two tags on ECR:
 
-- `latest` — mutable, always points at the most recent build.
-- `YYYYMMDD` — immutable date stamp (e.g. `20260427`). Use this when a service pipeline wants reproducibility (`image: contable/bitbucket-pipelines:20260427`).
+- `:latest` — mutable, always points at the most recent build.
+- `:YYYYMMDD` — immutable date stamp (e.g. `:20260427`). Use this when a service pipeline wants reproducibility.
 
-Service pipelines today use `image: contable/bitbucket-pipelines` (implicit `:latest`). Pinning to a date stamp is opt-in per service.
+Service pipelines that want the always-fresh build use `:latest`. Pipelines that want a stable point-in-time pin use the date stamp.
+
+A lifecycle policy on the ECR repository keeps the **last 10 images** and expires the rest, so the registry stays bounded.
+
+## Using this image in a service `bitbucket-pipelines.yml`
+
+```yaml
+image:
+  name: 829063853445.dkr.ecr.us-east-2.amazonaws.com/contable/bitbucket-pipelines:latest
+  aws:
+    access-key: $AWS_ACCESS_KEY_ID
+    secret-key: $AWS_SECRET_ACCESS_KEY
+```
+
+The `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` repository (or workspace) variables in Bitbucket are the same ones that the rest of the pipeline already uses for `aws ecr get-login-password`, `aws eks update-kubeconfig`, etc. — no new secrets to set up.
+
+To pin a specific build, replace `:latest` with the date stamp:
+
+```yaml
+image:
+  name: 829063853445.dkr.ecr.us-east-2.amazonaws.com/contable/bitbucket-pipelines:20260427
+  aws: ...
+```
 
 ## Build
 
-Multi-arch image (linux/arm64 + linux/amd64) via `docker buildx`:
+Multi-arch (linux/arm64 + linux/amd64) via `docker buildx`, pushing directly to ECR:
 
 ```bash
+# 1. Authenticate Docker to ECR (token valid 12h)
+aws ecr get-login-password --region us-east-2 --profile contable | \
+  docker login --username AWS --password-stdin 829063853445.dkr.ecr.us-east-2.amazonaws.com
+
+# 2. Build + push, tagging both `latest` and a date stamp
 DATE_TAG=$(date -u +%Y%m%d)
+ECR_URI=829063853445.dkr.ecr.us-east-2.amazonaws.com/contable/bitbucket-pipelines
 
 docker buildx build \
   --platform linux/arm64,linux/amd64 \
   --no-cache \
-  -t contable/bitbucket-pipelines:latest \
-  -t contable/bitbucket-pipelines:${DATE_TAG} \
+  -t "${ECR_URI}:latest" \
+  -t "${ECR_URI}:${DATE_TAG}" \
   --push \
   .
 ```
 
-The `--push` flag has buildx push directly to Docker Hub during the build (no separate `docker push` step needed for multi-arch — the manifest list is created in-place).
+The `--push` flag has buildx push directly to ECR during the build (no separate `docker push` step needed for multi-arch — the manifest list is created in-place).
 
 If you need to inspect locally without pushing first, drop `--push` and add `--load`, but `--load` doesn't work with multi-platform builds — single-arch only when loading.
 
 ## Verify
 
-After the push completes, smoke-test the published image:
+After the push completes, smoke-test the pulled image:
 
 ```bash
-docker pull contable/bitbucket-pipelines:latest
+ECR_URI=829063853445.dkr.ecr.us-east-2.amazonaws.com/contable/bitbucket-pipelines
 
-docker run --rm contable/bitbucket-pipelines:latest sh -c '
+aws ecr get-login-password --region us-east-2 --profile contable | \
+  docker login --username AWS --password-stdin 829063853445.dkr.ecr.us-east-2.amazonaws.com
+
+docker pull "${ECR_URI}:latest"
+
+docker run --rm "${ECR_URI}:latest" sh -c '
   aws --version &&
   kubectl version --client &&
   kustomize version &&
@@ -68,19 +101,24 @@ docker run --rm contable/bitbucket-pipelines:latest sh -c '
 '
 ```
 
-Each tool should print its version. The Dockerfile already runs the same checks at build time as a sanity check, so a broken release URL fails the build instead of producing a silently-broken image.
+Each tool should print its version. The Dockerfile also runs the same checks at build time as a sanity check, so a broken release URL fails the build instead of producing a silently-broken image.
 
 ## Troubleshooting
 
-If the build fails for a specific architecture, it's usually QEMU emulation needing a reset:
+**QEMU emulation glitches** during arm64 build → reset and retry:
 
 ```bash
 docker run --rm --privileged multiarch/qemu-user-static --reset -p yes -c yes
 ```
 
-Then re-run `docker buildx build`.
+**`--push` fails with auth errors** → re-login to ECR (the token expires after 12 hours):
 
-If `--push` fails with auth errors, run `docker login` first (Docker Hub credentials).
+```bash
+aws ecr get-login-password --region us-east-2 --profile contable | \
+  docker login --username AWS --password-stdin 829063853445.dkr.ecr.us-east-2.amazonaws.com
+```
+
+**A service pipeline can't pull this image** with `Error pulling image: pull access denied` → confirm the service's `bitbucket-pipelines.yml` has the `image.aws.access-key` / `secret-key` block (see "Using this image" above) and that the corresponding repository variables exist.
 
 ## Bumping a tool
 
