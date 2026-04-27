@@ -23,7 +23,13 @@ RUN apt-get update && \
 # Python tooling used across pipelines: awscli for ECR login + EKS
 # describe; fabric for older deploy scripts that haven't migrated;
 # boto3 for ad-hoc AWS scripting.
-RUN pip3 install --no-cache-dir awscli fabric boto3
+#
+# --break-system-packages: PEP 668 (enabled by default on Python 3.11+
+# in Debian/Ubuntu) blocks pip from writing into the system site-
+# packages. Inside a single-purpose container this is exactly what we
+# want, so we override it. Switching to AWS CLI v2 + pipx is queued
+# as follow-up if the container's Python ecosystem grows.
+RUN pip3 install --no-cache-dir --break-system-packages awscli fabric boto3
 
 # aws-iam-authenticator: maps IAM identities to Kubernetes users when
 # kubectl talks to EKS.
